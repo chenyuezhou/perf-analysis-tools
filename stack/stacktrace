@@ -1,0 +1,161 @@
+#! /usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+# Copyright © Chenyue Zhou (zcy.chenyue.zhou@gmail.com)
+#
+
+
+import time
+import ctypes
+import argparse
+import functools
+
+import bcc
+
+
+bpf_text = """
+#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+struct data_t {
+    u64 stack_id;
+    u32 pid;
+    char comm[TASK_COMM_LEN];
+};
+BPF_STACK_TRACE(stack_traces, 128);
+BPF_PERF_OUTPUT(events);
+void trace_stack(struct pt_regs *ctx) {
+    u32 pid = bpf_get_current_pid_tgid();
+    FILTER
+    struct data_t data = {};
+    data.stack_id = stack_traces.get_stackid(ctx, STACK_TYPE),
+    data.pid = pid;
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    events.perf_submit(ctx, &data, sizeof(data));
+}
+"""
+
+
+def print_event(cpu, data, size, args, bpf, stack_traces):
+    TASK_COMM_LEN = 16 # linux/sched.h
+
+    class Data(ctypes.Structure):
+        _fields_ = [("stack_id", ctypes.c_ulonglong),
+                    ("pid", ctypes.c_uint),
+                    ("comm", ctypes.c_char * TASK_COMM_LEN)]
+
+    event = ctypes.cast(data, ctypes.POINTER(Data)).contents
+
+    ts = time.time()
+
+    if args.verbose:
+        print("%-20.9f %-12.12s %-6d %-3d %s" %
+              (ts, event.comm.decode(), event.pid, cpu, args.function))
+    else:
+        print("%-20.9f %s" % (ts, args.function))
+
+    for addr in stack_traces.walk(event.stack_id):
+        if args.user_stack:
+            sym = bpf.sym(addr, event.pid, show_module=args.module,
+                    show_offset=args.offset)
+        else:
+            sym = bpf.ksym(addr, show_module=args.module,show_offset=args.offset)
+
+        if args.address:
+            print("\t%x %s" % (addr, sym))
+        else:
+            print("\t%s" % sym)
+
+    print("")
+
+
+def main(args):
+    global bpf_text
+
+    if args.pid:
+        bpf_text = bpf_text.replace("FILTER",
+            "if (pid != %s) { return; }" % args.pid)
+    else:
+        bpf_text = bpf_text.replace("FILTER", "")
+
+    if args.user_stack:
+        bpf_text = bpf_text.replace("STACK_TYPE", "BPF_F_USER_STACK")
+    else:
+        bpf_text = bpf_text.replace("STACK_TYPE", "0")
+
+    b = bcc.BPF(text=bpf_text)
+
+    parts = args.probe.split(':')
+
+    if args.user_stack:
+        if len(parts) != 2:
+            print("User probe need library:function\n")
+            exit()
+
+        args.library  = parts[0]
+        args.function = parts[1]
+        b.attach_uprobe(name=args.library, sym=args.function,
+                fn_name="trace_stack")
+        matched = b.num_open_uprobes()
+    else:
+        args.function = parts[0]
+
+        b.attach_kprobe(event=args.function, fn_name="trace_stack")
+        matched = b.num_open_kprobes()
+
+    if matched == 0:
+        print("Function \"%s\" not found. Exiting." % args.function)
+        exit()
+
+    stack_traces = b.get_table("stack_traces")
+
+    # header
+    if args.verbose:
+        print("%-20s %-12s %-6s %-3s %s" %
+                ("TIME(s)", "COMM", "PID", "CPU", "FUNCTION"))
+    else:
+        print("%-20s %s" % ("TIME(s)", "FUNCTION"))
+
+    b["events"].open_perf_buffer(functools.partial(print_event,
+                                                   args=args, bpf=b,
+                                                   stack_traces=stack_traces))
+    while 1:
+        try:
+            b.perf_buffer_poll()
+        except KeyboardInterrupt:
+            exit()
+
+
+if __name__ == "__main__":
+    # arguments
+    examples = """examples:
+        ./stacktrace ext4_sync_fs        # print kernel stack traces for ext4_sync_fs
+        ./stacktrace -s ext4_sync_fs     # ... show symbol offsets
+        ./stacktrace -v ext4_sync_fs     # ... show extra columns
+        ./stacktrace -p 185 ext4_sync_fs # ... only when PID 185 is on-CPU
+
+        ./stacktrace /usr/local/bin/nginx:ngx_close_connection -p 185 -U # print user stack for ngx_close_connection in /usr/local/bin/nginx
+    """
+    parser = argparse.ArgumentParser(
+        description="Trace and print kernel/user stack traces for a kernel/user function",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=examples)
+    parser.add_argument("-p", "--pid",
+        help="trace this PID only")
+    parser.add_argument("-a", "--address", action="store_true",
+        help="show address")
+    parser.add_argument("-s", "--offset", action="store_true",
+        help="show address offsets")
+    parser.add_argument("-m", "--module", action="store_true",
+        help="show address module belong to")
+    parser.add_argument("-v", "--verbose", action="store_true",
+        help="print more fields")
+    parser.add_argument("-U", "--user-stack", action="store_true",
+        help="output user stack trace")
+    parser.add_argument("-K", "--kernel-stack", action="store_true",
+        help="output kernel stack trace (default)")
+    parser.add_argument("probe",
+        help="probe specifier "
+             "(ext4_sync_fs,ngx_close_connection:/path/to/nginx)")
+    args = parser.parse_args()
+
+    main(args)
