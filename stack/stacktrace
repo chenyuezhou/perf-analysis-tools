@@ -94,7 +94,7 @@ def main(args):
         args.library  = parts[0]
         args.function = parts[1]
         b.attach_uprobe(name=args.library, sym=args.function,
-                fn_name="trace_stack")
+                fn_name="trace_stack", pid=args.pid or -1)
         matched = b.num_open_uprobes()
     else:
         args.function = parts[0]
@@ -139,7 +139,7 @@ if __name__ == "__main__":
         description="Trace and print kernel/user stack traces for a kernel/user function",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=examples)
-    parser.add_argument("-p", "--pid",
+    parser.add_argument("-p", "--pid", type=int,
         help="trace this PID only")
     parser.add_argument("-a", "--address", action="store_true",
         help="show address")
